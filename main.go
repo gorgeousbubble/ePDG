@@ -1,21 +1,39 @@
+// ePDG - Evolved Packet Data Gateway
+// Implements 3GPP TS 23.402, TS 24.302, TS 33.402
+//
+// Interfaces:
+//   SWu  - UE to ePDG (IKEv2/IPSec, UDP 500/4500)
+//   SWm  - ePDG to 3GPP AAA Server (Diameter, TCP 3868)
+//   S2b  - ePDG to P-GW (GTPv2-C/GTP-U, UDP 2123/2152)
 package main
 
 import (
-  "fmt"
+	"flag"
+	"fmt"
+	"os"
+
+	"ePDG/app"
+	"ePDG/config"
 )
 
-//TIP <p>To run your code, right-click the code and select <b>Run</b>.</p> <p>Alternatively, click
-// the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.</p>
-
 func main() {
-  //TIP <p>Press <shortcut actionId="ShowIntentionActions"/> when your caret is at the underlined text
-  // to see how GoLand suggests fixing the warning.</p><p>Alternatively, if available, click the lightbulb to view possible fixes.</p>
-  s := "gopher"
-  fmt.Println("Hello and welcome, %s!", s)
+	cfgPath := flag.String("config", "", "Path to JSON configuration file (optional, uses defaults if not specified)")
+	flag.Parse()
 
-  for i := 1; i <= 5; i++ {
-	//TIP <p>To start your debugging session, right-click your code in the editor and select the Debug option.</p> <p>We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint
-	// for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.</p>
-	fmt.Println("i =", 100/i)
-  }
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ePDG: load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	epdg, err := app.New(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ePDG: create: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := epdg.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "ePDG: run: %v\n", err)
+		os.Exit(1)
+	}
 }
