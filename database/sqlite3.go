@@ -97,7 +97,12 @@ func (s *SQLiteDB) QueryRow(query string, args ...interface{}) *sql.Row {
 	return s.QueryRowContext(context.Background(), query, args...)
 }
 
-// QueryRowContext perform query row SQL with context
+// QueryRowContext perform query row SQL with context.
+//
+// NOTE: unlike the standard library, this returns nil if the database has been
+// closed (s.db == nil), because a *sql.Row carrying a deferred error cannot be
+// constructed outside the database/sql package. Callers MUST nil-check the
+// result before calling Scan to avoid a nil-pointer panic.
 func (s *SQLiteDB) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	// sqlite3 database safe-lock
 	s.mu.Lock()

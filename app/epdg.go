@@ -5,6 +5,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -147,6 +148,8 @@ func (e *ePDG) Stop() {
 	}
 
 	logger.Info("ePDG stopped")
+	// Flush any buffered log entries before exit.
+	_ = logger.Sync()
 }
 
 // Status returns a summary of the ePDG status.
@@ -179,7 +182,8 @@ func (e *ePDG) Run() error {
 
 // handleGTPUPacket processes a received GTP-U G-PDU from the P-GW.
 // It forwards the inner IP packet to the UE via the IPSec tunnel.
-func (e *ePDG) handleGTPUPacket(teid uint32, payload []byte, src interface{}) {
+// The signature must match gtp.PacketHandler.
+func (e *ePDG) handleGTPUPacket(teid uint32, payload []byte, src *net.UDPAddr) {
 	// Find the session associated with this TEID
 	for _, sess := range e.sessions.All() {
 		if sess.LocalTEID == teid {
@@ -204,19 +208,30 @@ func (e *ePDG) sessionExpiryMonitor() {
 			now := time.Now()
 			for _, sess := range e.sessions.All() {
 				if !sess.SAExpiry.IsZero() && now.After(sess.SAExpiry) {
-					logger.Infof("Session %s (IMSI=%s) expired", sess.ID, sess.IMSI)
-					// Send STR to AAA
-					if sess.IMSI != "" && sess.DiameterSessionID != "" {
-						go e.diameter.SendSTR(sess.DiameterSessionID, sess.IMSI, 1) // 1=USER_REQUEST
-					}
-					sess.SetState(session.StateDisconnected)
-					e.sessions.Remove(sess.ID)
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					e.store.DeleteSession(ctx, sess.ID)
-					cancel()
+					e.expireSession(sess)
 				}
 			}
 		}
+	}
+}
+
+// expireSession tears down a single expired session: notifies the AAA server,
+// removes it from the in-memory manager, and deletes it from the store. It is a
+// separate method so that the per-session context's cancel is released via
+// defer even if a downstream call panics.
+func (e *ePDG) expireSession(sess *session.Session) {
+	logger.Infof("Session %s (IMSI=%s) expired", sess.ID, sess.IMSI)
+	// Notify the AAA server (best effort, asynchronous).
+	if sess.IMSI != "" && sess.DiameterSessionID != "" {
+		go e.diameter.SendSTR(sess.DiameterSessionID, sess.IMSI, 1) // 1=USER_REQUEST
+	}
+	sess.SetState(session.StateDisconnected)
+	e.sessions.Remove(sess.ID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := e.store.DeleteSession(ctx, sess.ID); err != nil {
+		logger.Warnf("Session %s: delete from store failed: %v", sess.ID, err)
 	}
 }
 

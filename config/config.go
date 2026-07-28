@@ -11,7 +11,7 @@ import (
 
 // Config is the top-level ePDG configuration.
 type Config struct {
-	ePDG     ePDGConfig     `json:"epdg"`
+	EPDG     EPDGConfig     `json:"epdg"`
 	IKE      IKEConfig      `json:"ike"`
 	EAP      EAPConfig      `json:"eap"`
 	GTP      GTPConfig      `json:"gtp"`
@@ -20,8 +20,10 @@ type Config struct {
 	Logger   LoggerConfig   `json:"logger"`
 }
 
-// ePDGConfig holds general ePDG node configuration.
-type ePDGConfig struct {
+// EPDGConfig holds general ePDG node configuration.
+// Note: the type and field must be exported so that encoding/json can populate
+// them from the "epdg" configuration section.
+type EPDGConfig struct {
 	// FQDN is the ePDG fully qualified domain name (used in IKEv2 ID payload).
 	FQDN string `json:"fqdn"`
 	// PublicIP is the ePDG public IP address (SWu interface).
@@ -151,7 +153,7 @@ type LoggerConfig struct {
 // DefaultConfig returns a sensible default configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		ePDG: ePDGConfig{
+		EPDG: EPDGConfig{
 			FQDN:       "epdg.example.com",
 			PublicIP:   "0.0.0.0",
 			InternalIP: "127.0.0.1",
@@ -247,10 +249,10 @@ func Load(path string) (*Config, error) {
 
 // Validate checks that required fields are set.
 func (c *Config) Validate() error {
-	if c.ePDG.PublicIP == "" {
+	if c.EPDG.PublicIP == "" {
 		return fmt.Errorf("epdg.public_ip is required")
 	}
-	if c.ePDG.CertFile == "" || c.ePDG.KeyFile == "" {
+	if c.EPDG.CertFile == "" || c.EPDG.KeyFile == "" {
 		return fmt.Errorf("epdg.cert_file and epdg.key_file are required")
 	}
 	if c.IKE.ListenAddr == "" {
@@ -263,7 +265,7 @@ func (c *Config) Validate() error {
 }
 
 // GetePDG returns the ePDG node configuration.
-func (c *Config) GetePDG() ePDGConfig { return c.ePDG }
+func (c *Config) GetePDG() EPDGConfig { return c.EPDG }
 
 // GetIKE returns the IKEv2 configuration.
 func (c *Config) GetIKE() IKEConfig { return c.IKE }

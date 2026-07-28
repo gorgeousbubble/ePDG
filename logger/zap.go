@@ -80,10 +80,22 @@ func Init(cfg Config) error {
 	core := zapcore.NewTee(cores...)
 	// create logger with debug information
 	logger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
-	defer logger.Sync()
-	// create SugaredLogger
+	// NOTE: do NOT Sync() here. Syncing at Init time is pointless (nothing has
+	// been logged yet). Buffered logs must be flushed at program shutdown via
+	// the exported Sync() function (see app.Stop).
 	globalLogger = logger.Sugar()
 	return nil
+}
+
+// Sync flushes any buffered log entries. Call it once during graceful shutdown.
+// It is safe to call when the logger is uninitialised.
+func Sync() error {
+	if globalLogger == nil {
+		return nil
+	}
+	// zap returns a harmless error when syncing stdout/stderr on some
+	// platforms; callers may ignore it.
+	return globalLogger.Sync()
 }
 
 // getJSONEncoder get Json encoder

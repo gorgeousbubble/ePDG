@@ -11,7 +11,7 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"ePDG/config"
@@ -31,8 +31,6 @@ type Handler struct {
 	cert       tls.Certificate
 	caCertPool *x509.CertPool
 	localSPI   [8]byte // ePDG responder SPI prefix (random per instance)
-	spiCounter uint64
-	mu         sync.Mutex
 }
 
 // New creates a new IKEv2 handler.
@@ -58,7 +56,9 @@ func New(cfg *config.Config, sessions *session.Manager, diam *diameter.Client) (
 		caCertPool: caCertPool,
 	}
 	// generate random SPI prefix
-	rand.Read(h.localSPI[:])
+	if _, err := rand.Read(h.localSPI[:]); err != nil {
+		return nil, fmt.Errorf("IKE handler: generate SPI prefix: %w", err)
+	}
 	return h, nil
 }
 
@@ -151,7 +151,10 @@ func (h *Handler) handleIKESAInit(raw []byte, hdr *message.IKEHeader, src *net.U
 
 	// Generate responder SPI
 	var respSPI [8]byte
-	rand.Read(respSPI[:])
+	if _, err := rand.Read(respSPI[:]); err != nil {
+		logger.Errorf("IKE_SA_INIT: generate responder SPI: %v", err)
+		return
+	}
 
 	// Derive IKE SA keys
 	keys := ikecrypto.DeriveIKEKeys(dhShared, noncePayload.NonceData, nonceR,
@@ -240,12 +243,89 @@ func (h *Handler) handleIKESAInit(raw []byte, hdr *message.IKEHeader, src *net.U
 	logger.Infof("IKE_SA_INIT: session %s created for %s", sess.ID, src)
 }
 
-// selectIKEProposal selects the first acceptable IKE SA proposal.
+// Acceptable IKE SA algorithms. These are intentionally restricted to what the
+// crypto layer actually implements (AES-CBC, HMAC-SHA2, MODP-2048) so that a
+// peer cannot negotiate a weak or unimplemented algorithm (e.g. DES, NULL,
+// HMAC-MD5, MODP-1024). Order expresses preference (most preferred first).
+var (
+	acceptableEncr  = []uint16{message.EncrAESCBC, message.EncrAESGCM16}
+	acceptablePRF   = []uint16{message.PRFHMACSha256, message.PRFHMACSha384, message.PRFHMACSha512}
+	acceptableInteg = []uint16{message.IntegHMACSHA2_256_128, message.IntegHMACSHA2_512_256}
+	acceptableDH    = []uint16{message.DHGroup14} // only MODP-2048 is implemented
+	// Minimum acceptable AES key length in bits (reject AES-128 downgrade).
+	minAESKeyLenBits uint16 = 128
+)
+
+// pickTransform returns the first transform of the given type whose ID appears
+// in the allowed list, preserving the caller's preference order in allowed.
+func pickTransform(transforms []message.Transform, tType message.TransformType, allowed []uint16) (message.Transform, bool) {
+	for _, want := range allowed {
+		for _, t := range transforms {
+			if t.Type == tType && t.ID == want {
+				return t, true
+			}
+		}
+	}
+	return message.Transform{}, false
+}
+
+// aesKeyLenBits extracts the KEY_LENGTH attribute (in bits) from a transform,
+// returning 0 if absent.
+func aesKeyLenBits(t message.Transform) uint16 {
+	for _, a := range t.Attributes {
+		// KEY_LENGTH is attribute type 14; bit 15 set marks TV format.
+		if a.Type == 0x800E && len(a.Value) == 2 {
+			return uint16(a.Value[0])<<8 | uint16(a.Value[1])
+		}
+	}
+	return 0
+}
+
+// selectIKEProposal selects the first IKE (ProtocolID==1) proposal that offers
+// an acceptable transform of every required type, and returns a NEW proposal
+// containing exactly one chosen transform per type as required by RFC 7296
+// §3.3. Returns nil if no proposal is acceptable.
 func (h *Handler) selectIKEProposal(sa *message.SAPayload) *message.Proposal {
 	for i := range sa.Proposals {
 		p := &sa.Proposals[i]
-		if p.ProtocolID == 1 { // IKE
-			return p
+		if p.ProtocolID != 1 { // 1 = IKE
+			continue
+		}
+
+		encr, ok := pickTransform(p.Transforms, message.TransformTypeEncr, acceptableEncr)
+		if !ok {
+			continue
+		}
+		// For AES-CBC, enforce a minimum key length and require the attribute.
+		if encr.ID == message.EncrAESCBC {
+			if kl := aesKeyLenBits(encr); kl < minAESKeyLenBits {
+				continue
+			}
+		}
+		prf, ok := pickTransform(p.Transforms, message.TransformTypePRF, acceptablePRF)
+		if !ok {
+			continue
+		}
+		dh, ok := pickTransform(p.Transforms, message.TransformTypeDH, acceptableDH)
+		if !ok {
+			continue
+		}
+		// AES-GCM is AEAD and carries no separate integrity transform; AES-CBC
+		// requires one.
+		chosen := []message.Transform{encr, prf, dh}
+		if encr.ID == message.EncrAESCBC {
+			integ, ok := pickTransform(p.Transforms, message.TransformTypeInteg, acceptableInteg)
+			if !ok {
+				continue
+			}
+			chosen = []message.Transform{encr, prf, integ, dh}
+		}
+
+		return &message.Proposal{
+			Number:     p.Number,
+			ProtocolID: p.ProtocolID,
+			SPI:        p.SPI,
+			Transforms: chosen,
 		}
 	}
 	return nil
@@ -261,6 +341,10 @@ func (h *Handler) handleIKEAuth(raw []byte, hdr *message.IKEHeader, src *net.UDP
 		logger.Warnf("IKE_AUTH: no session for SPI %x from %s", hdr.InitiatorSPI, src)
 		return
 	}
+	// Serialise processing for this session to protect its fields from
+	// concurrent receive goroutines.
+	sess.BeginProcessing()
+	defer sess.EndProcessing()
 
 	// Decrypt SK payload
 	skPayload, ok2 := findSKPayload(raw)
@@ -268,7 +352,7 @@ func (h *Handler) handleIKEAuth(raw []byte, hdr *message.IKEHeader, src *net.UDP
 		logger.Warnf("IKE_AUTH: no SK payload from %s", src)
 		return
 	}
-	decrypted, err := h.decryptSK(sess, skPayload, raw, false)
+	decrypted, err := h.decryptSK(sess, skPayload, raw)
 	if err != nil {
 		logger.Warnf("IKE_AUTH: decrypt SK: %v", err)
 		return
@@ -284,7 +368,7 @@ func (h *Handler) handleIKEAuth(raw []byte, hdr *message.IKEHeader, src *net.UDP
 	// Extract IDi
 	idPayload, _ := innerMsg.FindPayload(message.PayloadTypeIDi).(*message.IDPayload)
 	if idPayload == nil {
-		h.sendEncryptedNotify(conn, src, sess, message.NotifyInvalidSyntax, nil)
+		h.sendEncryptedNotify(conn, src, sess, hdr.MessageID, message.NotifyInvalidSyntax, nil)
 		return
 	}
 
@@ -346,13 +430,13 @@ func (h *Handler) startEAPExchange(conn *net.UDPConn, src *net.UDPAddr, sess *se
 	dea, err := h.diameter.SendDER(derReq)
 	if err != nil {
 		logger.Errorf("IKE_AUTH: DER failed for %s: %v", nai, err)
-		h.sendEncryptedNotify(conn, src, sess, message.NotifyAuthenticationFailed, nil)
+		h.sendEncryptedNotify(conn, src, sess, hdr.MessageID, message.NotifyAuthenticationFailed, nil)
 		return
 	}
 
 	if dea.ResultCode != diameter.ResultSuccess && dea.ResultCode != diameter.ResultLimitedSuccess {
 		logger.Warnf("IKE_AUTH: AAA rejected %s: result=%d", nai, dea.ResultCode)
-		h.sendEncryptedNotify(conn, src, sess, message.NotifyAuthenticationFailed, nil)
+		h.sendEncryptedNotify(conn, src, sess, hdr.MessageID, message.NotifyAuthenticationFailed, nil)
 		return
 	}
 
@@ -360,7 +444,7 @@ func (h *Handler) startEAPExchange(conn *net.UDPConn, src *net.UDPAddr, sess *se
 	sess.SetState(session.StateEAPChallenge)
 	sess.EAPIdentifier++
 
-	h.sendIKEAuthWithEAP(conn, src, sess, hdr, dea.EAPPayload)
+	h.sendIKEAuthWithEAP(conn, src, sess, hdr.MessageID, dea.EAPPayload)
 	logger.Infof("IKE_AUTH: EAP-AKA challenge sent to %s (IMSI=%s)", src, sess.IMSI)
 }
 
@@ -370,7 +454,7 @@ func (h *Handler) continueEAPExchange(conn *net.UDPConn, src *net.UDPAddr, sess 
 	cpPayload *message.CPPayload, tsiPayload, tsrPayload *message.TSPayload) {
 
 	if eapPayload == nil {
-		h.sendEncryptedNotify(conn, src, sess, message.NotifyAuthenticationFailed, nil)
+		h.sendEncryptedNotify(conn, src, sess, hdr.MessageID, message.NotifyAuthenticationFailed, nil)
 		return
 	}
 
@@ -385,7 +469,7 @@ func (h *Handler) continueEAPExchange(conn *net.UDPConn, src *net.UDPAddr, sess 
 	dea, err := h.diameter.SendDER(derReq)
 	if err != nil {
 		logger.Errorf("IKE_AUTH: DER (challenge response) failed: %v", err)
-		h.sendEncryptedNotify(conn, src, sess, message.NotifyAuthenticationFailed, nil)
+		h.sendEncryptedNotify(conn, src, sess, hdr.MessageID, message.NotifyAuthenticationFailed, nil)
 		return
 	}
 
@@ -401,13 +485,13 @@ func (h *Handler) continueEAPExchange(conn *net.UDPConn, src *net.UDPAddr, sess 
 
 	// Another EAP round (e.g. re-sync)
 	if dea.ResultCode == diameter.ResultLimitedSuccess {
-		h.sendIKEAuthWithEAP(conn, src, sess, hdr, dea.EAPPayload)
+		h.sendIKEAuthWithEAP(conn, src, sess, hdr.MessageID, dea.EAPPayload)
 		return
 	}
 
 	// Authentication failed
 	logger.Warnf("IKE_AUTH: EAP authentication failed for IMSI=%s", sess.IMSI)
-	h.sendEncryptedNotify(conn, src, sess, message.NotifyAuthenticationFailed, nil)
+	h.sendEncryptedNotify(conn, src, sess, hdr.MessageID, message.NotifyAuthenticationFailed, nil)
 	sess.SetState(session.StateDisconnected)
 	h.sessions.Remove(sess.ID)
 }
@@ -434,8 +518,7 @@ func (h *Handler) completeIKEAuth(conn *net.UDPConn, src *net.UDPAddr, sess *ses
 
 	// Build IKE_AUTH response payloads
 	// IDr payload
-	idrPayload := &message.IDPayload{}
-	idrPayload = buildIDrPayload(h.cfg.GetePDG().FQDN)
+	idrPayload := buildIDrPayload(h.cfg.GetePDG().FQDN)
 
 	// AUTH payload (shared-key based on EAP MSK)
 	authData := ikecrypto.ComputeAuthPayload(
@@ -474,7 +557,7 @@ func (h *Handler) completeIKEAuth(conn *net.UDPConn, src *net.UDPAddr, sess *ses
 	}
 
 	// Encrypt and send
-	if err := h.sendEncryptedIKEAuth(conn, src, sess, hdr, innerPayloads); err != nil {
+	if err := h.sendEncryptedResponse(conn, src, sess, hdr.MessageID, message.IKE_AUTH, innerPayloads); err != nil {
 		logger.Errorf("IKE_AUTH: send response: %v", err)
 		return
 	}
@@ -491,12 +574,14 @@ func (h *Handler) handleInformational(raw []byte, hdr *message.IKEHeader, src *n
 	if !ok {
 		return
 	}
+	sess.BeginProcessing()
+	defer sess.EndProcessing()
 	// Decrypt
 	skPayload, ok2 := findSKPayload(raw)
 	if !ok2 {
 		return
 	}
-	decrypted, err := h.decryptSK(sess, skPayload, raw, false)
+	decrypted, err := h.decryptSK(sess, skPayload, raw)
 	if err != nil {
 		return
 	}
@@ -510,7 +595,7 @@ func (h *Handler) handleInformational(raw []byte, hdr *message.IKEHeader, src *n
 		if del, ok := p.(*message.DeletePayload); ok {
 			if del.ProtocolID == 1 { // IKE SA delete
 				logger.Infof("INFORMATIONAL: IKE SA delete from %s (session %s)", src, sess.ID)
-				h.sendEmptyInformationalResponse(conn, src, sess, hdr)
+				h.sendEmptyInformationalResponse(conn, src, sess, hdr.MessageID)
 				sess.SetState(session.StateDisconnected)
 				h.sessions.Remove(sess.ID)
 				return
@@ -519,7 +604,7 @@ func (h *Handler) handleInformational(raw []byte, hdr *message.IKEHeader, src *n
 	}
 
 	// DPD keepalive - send empty response
-	h.sendEmptyInformationalResponse(conn, src, sess, hdr)
+	h.sendEmptyInformationalResponse(conn, src, sess, hdr.MessageID)
 }
 
 // ---- CREATE_CHILD_SA ----
@@ -529,24 +614,21 @@ func (h *Handler) handleCreateChildSA(raw []byte, hdr *message.IKEHeader, src *n
 	if !ok {
 		return
 	}
+	sess.BeginProcessing()
+	defer sess.EndProcessing()
 	logger.Debugf("CREATE_CHILD_SA: session %s", sess.ID)
 	// For now, send TEMPORARY_FAILURE to decline child SA rekey
-	h.sendEncryptedNotify(conn, src, sess, message.NotifyTemporaryFailure, nil)
+	h.sendEncryptedNotify(conn, src, sess, hdr.MessageID, message.NotifyTemporaryFailure, nil)
 }
 
 // ---- Crypto helpers ----
 
-// decryptSK decrypts an SK payload using the session keys.
-// isInitiator=true uses SK_ei/SK_ai, false uses SK_er/SK_ar.
-func (h *Handler) decryptSK(sess *session.Session, skData, fullMsg []byte, isInitiator bool) ([]byte, error) {
-	var encKey, integKey []byte
-	if isInitiator {
-		encKey = sess.Keys.SK_ei
-		integKey = sess.Keys.SK_ai
-	} else {
-		encKey = sess.Keys.SK_er
-		integKey = sess.Keys.SK_ar
-	}
+// decryptSK decrypts an SK payload received from the UE.
+// The ePDG is always the IKEv2 responder, so incoming messages are encrypted
+// by the initiator (UE) using SK_ei/SK_ai (RFC 7296 §2.14).
+func (h *Handler) decryptSK(sess *session.Session, skData, fullMsg []byte) ([]byte, error) {
+	encKey := sess.Keys.SK_ei
+	integKey := sess.Keys.SK_ai
 	// Verify integrity: ICV is last 16 bytes
 	if len(skData) < 16 {
 		return nil, fmt.Errorf("SK: too short for ICV")
@@ -573,16 +655,12 @@ func (h *Handler) decryptSK(sess *session.Session, skData, fullMsg []byte, isIni
 	return plaintext[:len(plaintext)-padLen-1], nil
 }
 
-// encryptSK encrypts inner payloads into an SK payload.
-func (h *Handler) encryptSK(sess *session.Session, innerPayloads []byte, isInitiator bool) ([]byte, error) {
-	var encKey, integKey []byte
-	if isInitiator {
-		encKey = sess.Keys.SK_ei
-		integKey = sess.Keys.SK_ai
-	} else {
-		encKey = sess.Keys.SK_er
-		integKey = sess.Keys.SK_ar
-	}
+// encryptSK encrypts inner payloads into an SK payload for sending to the UE.
+// The ePDG is always the IKEv2 responder, so outgoing messages are encrypted
+// with the responder keys SK_er/SK_ar (RFC 7296 §2.14).
+func (h *Handler) encryptSK(sess *session.Session, innerPayloads []byte) ([]byte, error) {
+	encKey := sess.Keys.SK_er
+	integKey := sess.Keys.SK_ar
 	// Add padding: pad to AES block size (16), last byte = pad length
 	blockSize := 16
 	padLen := blockSize - ((len(innerPayloads) + 1) % blockSize)
@@ -637,29 +715,27 @@ func (h *Handler) sendNotify(conn *net.UDPConn, dst *net.UDPAddr, reqHdr *messag
 }
 
 func (h *Handler) sendEncryptedNotify(conn *net.UDPConn, dst *net.UDPAddr, sess *session.Session,
-	notifyType message.NotifyType, data []byte) {
+	messageID uint32, notifyType message.NotifyType, data []byte) {
 	notify := &message.NotifyPayload{NotifyType: notifyType, NotifyData: data}
-	h.sendEncryptedResponse(conn, dst, sess, message.INFORMATIONAL, []message.IKEPayload{notify})
+	h.sendEncryptedResponse(conn, dst, sess, messageID, message.INFORMATIONAL, []message.IKEPayload{notify})
 }
 
+// sendIKEAuthWithEAP sends an IKE_AUTH response carrying a single EAP payload.
 func (h *Handler) sendIKEAuthWithEAP(conn *net.UDPConn, dst *net.UDPAddr, sess *session.Session,
-	reqHdr *message.IKEHeader, eapMsg []byte) {
+	messageID uint32, eapMsg []byte) {
 	eapPayload := &message.EAPPayload{EAPMessage: eapMsg}
-	h.sendEncryptedResponse(conn, dst, sess, message.IKE_AUTH, []message.IKEPayload{eapPayload})
+	h.sendEncryptedResponse(conn, dst, sess, messageID, message.IKE_AUTH, []message.IKEPayload{eapPayload})
 }
 
-func (h *Handler) sendEncryptedIKEAuth(conn *net.UDPConn, dst *net.UDPAddr, sess *session.Session,
-	reqHdr *message.IKEHeader, payloads []message.IKEPayload) error {
-	return h.sendEncryptedResponse(conn, dst, sess, message.IKE_AUTH, payloads)
-}
-
+// sendEmptyInformationalResponse acknowledges an INFORMATIONAL request (e.g. a
+// DPD keepalive) with an empty encrypted response.
 func (h *Handler) sendEmptyInformationalResponse(conn *net.UDPConn, dst *net.UDPAddr,
-	sess *session.Session, reqHdr *message.IKEHeader) {
-	h.sendEncryptedResponse(conn, dst, sess, message.INFORMATIONAL, nil)
+	sess *session.Session, messageID uint32) {
+	h.sendEncryptedResponse(conn, dst, sess, messageID, message.INFORMATIONAL, nil)
 }
 
 func (h *Handler) sendEncryptedResponse(conn *net.UDPConn, dst *net.UDPAddr, sess *session.Session,
-	exchangeType message.ExchangeType, payloads []message.IKEPayload) error {
+	messageID uint32, exchangeType message.ExchangeType, payloads []message.IKEPayload) error {
 
 	// Encode inner payloads
 	var innerBytes []byte
@@ -680,21 +756,22 @@ func (h *Handler) sendEncryptedResponse(conn *net.UDPConn, dst *net.UDPAddr, ses
 	}
 
 	// Encrypt
-	skData, err := h.encryptSK(sess, innerBytes, false) // false = responder
+	skData, err := h.encryptSK(sess, innerBytes) // ePDG is responder, uses SK_er/SK_ar
 	if err != nil {
 		return fmt.Errorf("encrypt SK: %w", err)
 	}
 
-	// Build outer message
+	// Build outer message. Per RFC 7296 §2.2 a response MUST carry the same
+	// Message ID as the request it answers, so we echo the request's MessageID
+	// rather than using an independent counter.
 	respHdr := &message.IKEHeader{
 		InitiatorSPI: sess.InitiatorSPI,
 		ResponderSPI: sess.ResponderSPI,
 		MajorVersion: 2,
 		ExchangeType: exchangeType,
 		Flags:        message.FlagResponse,
-		MessageID:    sess.MessageIDr,
+		MessageID:    messageID,
 	}
-	sess.MessageIDr++
 
 	skPayload := &message.SKPayload{EncryptedData: skData}
 	msg := &message.IKEMessage{Header: respHdr, Payloads: []message.IKEPayload{skPayload}}
@@ -775,8 +852,11 @@ func buildEAPSuccess(id uint8) []byte {
 	return b
 }
 
+// buildIDrPayload builds the responder identity (IDr) payload using the
+// ePDG FQDN. UE uses this identity to verify the ePDG and to compute the
+// expected AUTH value, so it must not be empty (RFC 7296 §3.5).
 func buildIDrPayload(fqdn string) *message.IDPayload {
-	return &message.IDPayload{}
+	return message.NewIDPayload(message.PayloadTypeIDr, message.IDTypeFQDN, []byte(fqdn))
 }
 
 func buildIDrBody(fqdn string) []byte {
@@ -820,7 +900,7 @@ func buildChildSAPayload(spiIn uint32) *message.SAPayload {
 				ProtocolID: 3, // ESP
 				SPI:        spiBytes,
 				Transforms: []message.Transform{
-					{Type: message.TransformTypeEncr, ID: message.EncrAESCBC256,
+					{Type: message.TransformTypeEncr, ID: message.EncrAESCBC,
 						Attributes: []message.TransformAttribute{message.KeyLengthAttribute(256)}},
 					{Type: message.TransformTypeInteg, ID: message.IntegHMACSHA2_256_128},
 					{Type: message.TransformTypeESN, ID: message.ESNNo},
@@ -838,9 +918,12 @@ func buildDefaultTSr() *message.TSPayload {
 	return &message.TSPayload{}
 }
 
+// spiCounter is the monotonically increasing source for Child SA SPIs.
+// Access must be atomic because IKE messages are handled concurrently in
+// separate goroutines (see ike.Server.receiveLoop).
 var spiCounter uint32 = 0x10000000
 
+// allocateSPI returns a new unique Child SA SPI in a concurrency-safe way.
 func allocateSPI() uint32 {
-	spiCounter++
-	return spiCounter
+	return atomic.AddUint32(&spiCounter, 1)
 }

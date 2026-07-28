@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -15,18 +16,32 @@ import (
 	"ePDG/session"
 )
 
+// dbDriver is the minimal database interface the store needs. Both
+// *database.SQLiteDB and *database.MySqlDB satisfy it, which lets the store
+// hold a single driver and avoid per-method sqlite/mysql branching.
+type dbDriver interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	Close() error
+}
+
 // Store is the ePDG session persistence layer.
 type Store struct {
-	sqlite *database.SQLiteDB
-	mysql  *database.MySqlDB
-	dbType string
+	db     dbDriver
+	dbType string // "sqlite" or "mysql", used only to select SQL dialect
 }
 
 // New creates a new Store based on the database configuration.
 func New(cfg config.DatabaseConfig) (*Store, error) {
-	s := &Store{dbType: cfg.Type}
-	switch cfg.Type {
-	case "sqlite", "":
+	dbType := cfg.Type
+	if dbType == "" {
+		dbType = "sqlite"
+	}
+	s := &Store{dbType: dbType}
+
+	switch dbType {
+	case "sqlite":
 		path := cfg.SQLitePath
 		if path == "" {
 			path = "./data/epdg.db"
@@ -35,10 +50,7 @@ func New(cfg config.DatabaseConfig) (*Store, error) {
 		if err != nil {
 			return nil, fmt.Errorf("store: sqlite: %w", err)
 		}
-		s.sqlite = db
-		if err := s.initSQLiteSchema(); err != nil {
-			return nil, fmt.Errorf("store: init schema: %w", err)
-		}
+		s.db = db
 	case "mysql":
 		db, err := database.NewMySqlDB(database.Config{
 			Host:     cfg.MySQL.Host,
@@ -50,24 +62,22 @@ func New(cfg config.DatabaseConfig) (*Store, error) {
 		if err != nil {
 			return nil, fmt.Errorf("store: mysql: %w", err)
 		}
-		s.mysql = db
-		if err := s.initMySQLSchema(); err != nil {
-			return nil, fmt.Errorf("store: init schema: %w", err)
-		}
+		s.db = db
 	default:
 		return nil, fmt.Errorf("store: unknown database type %q", cfg.Type)
 	}
-	logger.Infof("Store: using %s database", cfg.Type)
+
+	if err := s.initSchema(); err != nil {
+		return nil, fmt.Errorf("store: init schema: %w", err)
+	}
+	logger.Infof("Store: using %s database", dbType)
 	return s, nil
 }
 
 // Close closes the database connection.
 func (s *Store) Close() error {
-	if s.sqlite != nil {
-		return s.sqlite.Close()
-	}
-	if s.mysql != nil {
-		return s.mysql.Close()
+	if s.db != nil {
+		return s.db.Close()
 	}
 	return nil
 }
@@ -116,13 +126,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 `
 
-func (s *Store) initSQLiteSchema() error {
-	_, err := s.sqlite.Exec(sqliteSchema)
-	return err
-}
-
-func (s *Store) initMySQLSchema() error {
-	_, err := s.mysql.Exec(mysqlSchema)
+// initSchema creates the sessions table using the dialect-appropriate schema.
+func (s *Store) initSchema() error {
+	schema := sqliteSchema
+	if s.dbType == "mysql" {
+		schema = mysqlSchema
+	}
+	_, err := s.db.ExecContext(context.Background(), schema)
 	return err
 }
 
@@ -166,22 +176,14 @@ func (s *Store) SaveSession(ctx context.Context, sess *session.Session) error {
 		sess.SAExpiry.UTC().Format(time.RFC3339),
 	}
 
-	if s.sqlite != nil {
-		_, err := s.sqlite.ExecContext(ctx, query, args...)
-		return err
-	}
-	_, err := s.mysql.Exec(query, args...)
+	_, err := s.db.ExecContext(ctx, query, args...)
 	return err
 }
 
 // DeleteSession removes a session from the database.
 func (s *Store) DeleteSession(ctx context.Context, id string) error {
 	query := "DELETE FROM sessions WHERE id = ?"
-	if s.sqlite != nil {
-		_, err := s.sqlite.ExecContext(ctx, query, id)
-		return err
-	}
-	_, err := s.mysql.Exec(query, id)
+	_, err := s.db.ExecContext(ctx, query, id)
 	return err
 }
 
@@ -206,25 +208,14 @@ type SessionRecord struct {
 // GetSession retrieves a session record by ID.
 func (s *Store) GetSession(ctx context.Context, id string) (*SessionRecord, error) {
 	query := "SELECT id, imsi, msisdn, apn, state, assigned_ipv4, assigned_ipv6, local_teid, remote_teid, pgw_addr, diameter_sid, created_at, updated_at, expires_at FROM sessions WHERE id = ?"
-	var row *sql.Row
-	if s.sqlite != nil {
-		row = s.sqlite.QueryRowContext(ctx, query, id)
-	} else {
-		row = s.mysql.QueryRow(query, id)
-	}
+	row := s.db.QueryRowContext(ctx, query, id)
 	return scanSessionRecord(row)
 }
 
 // ListActiveSessions returns all sessions in non-terminal states.
 func (s *Store) ListActiveSessions(ctx context.Context) ([]*SessionRecord, error) {
-	query := fmt.Sprintf("SELECT id, imsi, msisdn, apn, state, assigned_ipv4, assigned_ipv6, local_teid, remote_teid, pgw_addr, diameter_sid, created_at, updated_at, expires_at FROM sessions WHERE state < %d", int(session.StateDisconnected))
-	var rows *sql.Rows
-	var err error
-	if s.sqlite != nil {
-		rows, err = s.sqlite.QueryContext(ctx, query)
-	} else {
-		rows, err = s.mysql.Query(query)
-	}
+	query := "SELECT id, imsi, msisdn, apn, state, assigned_ipv4, assigned_ipv6, local_teid, remote_teid, pgw_addr, diameter_sid, created_at, updated_at, expires_at FROM sessions WHERE state < ?"
+	rows, err := s.db.QueryContext(ctx, query, int(session.StateDisconnected))
 	if err != nil {
 		return nil, err
 	}
@@ -242,6 +233,11 @@ func (s *Store) ListActiveSessions(ctx context.Context) ([]*SessionRecord, error
 }
 
 func scanSessionRecord(row *sql.Row) (*SessionRecord, error) {
+	// QueryRowContext may return nil if the underlying database has been closed;
+	// guard against a nil-pointer panic in Scan.
+	if row == nil {
+		return nil, errors.New("store: database not connected")
+	}
 	rec := &SessionRecord{}
 	var ipv4Str, ipv6Str, expiresStr, createdStr, updatedStr string
 	err := row.Scan(&rec.ID, &rec.IMSI, &rec.MSISDN, &rec.APN, &rec.State,

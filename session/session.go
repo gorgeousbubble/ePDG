@@ -3,11 +3,14 @@
 package session
 
 import (
-	"ePDG/ike/crypto"
 	"fmt"
+	"math/big"
 	"net"
 	"sync"
 	"time"
+
+	"ePDG/eap"
+	"ePDG/ike/crypto"
 
 	"github.com/google/uuid"
 )
@@ -42,6 +45,14 @@ func (s State) String() string {
 type Session struct {
 	mu sync.RWMutex
 
+	// procMu serialises message processing for this session. IKEv2 is a
+	// sequential state machine per SA, so the handler holds this lock for the
+	// whole duration of handling one message, which protects all the fields
+	// below from concurrent access by multiple receive goroutines. It is kept
+	// separate from mu (used by SetState/GetState) so that SetState calls made
+	// while processing do not deadlock.
+	procMu sync.Mutex
+
 	// Identifiers
 	ID        string    // internal UUID
 	IMSI      string    // UE IMSI (from EAP identity)
@@ -56,13 +67,20 @@ type Session struct {
 	// IKEv2 SA parameters
 	InitiatorSPI [8]byte
 	ResponderSPI [8]byte
-	MessageIDi   uint32 // next expected initiator message ID
-	MessageIDr   uint32 // next sent responder message ID
+	// MessageIDi is the next expected Message ID for requests originated by the
+	// initiator (UE). Used to detect retransmissions/replays. Responses always
+	// echo the request's Message ID (RFC 7296 §2.2) and do NOT use a counter.
+	MessageIDi uint32
+	// MessageIDr is the next Message ID for requests the ePDG itself originates
+	// (e.g. DPD or Delete INFORMATIONAL exchanges), per RFC 7296 §2.2.
+	MessageIDr uint32
 
-	// DH key exchange
-	DHPrivate interface{} // *big.Int for MODP, *ecdh.PrivateKey for ECP
-	DHPublic  []byte      // our public key bytes
-	DHShared  []byte      // shared secret
+	// DH key exchange. Only MODP groups are implemented, so the private key is
+	// a *big.Int. (If ECP groups are added later this can become an interface
+	// or a dedicated type.)
+	DHPrivate *big.Int // MODP private exponent
+	DHPublic  []byte   // our public key bytes
+	DHShared  []byte   // shared secret
 
 	// Nonces
 	NonceI []byte // initiator nonce
@@ -81,9 +99,9 @@ type Session struct {
 	RAND          []byte // 16 bytes
 	AUTN          []byte // 16 bytes
 	XRES          []byte // expected RES
-	CK            []byte // cipher key
-	IK            []byte // integrity key
-	EAPKeys       interface{} // *eap.AKAPrimeKeys
+	CK            []byte             // cipher key
+	IK            []byte             // integrity key
+	EAPKeys       *eap.AKAPrimeKeys  // derived EAP-AKA' key material
 
 	// Network addresses
 	UEAddr    *net.UDPAddr // UE source address
@@ -141,6 +159,19 @@ func (s *Session) GetState() State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.State
+}
+
+// BeginProcessing acquires the per-session processing lock. The handler must
+// call this before reading or mutating session fields for an incoming message,
+// and pair it with EndProcessing (typically via defer). This serialises
+// concurrent receive goroutines that target the same session.
+func (s *Session) BeginProcessing() {
+	s.procMu.Lock()
+}
+
+// EndProcessing releases the per-session processing lock.
+func (s *Session) EndProcessing() {
+	s.procMu.Unlock()
 }
 
 // ---- Session Manager ----

@@ -100,6 +100,22 @@ func (m *MySqlDB) QueryRow(query string, args ...interface{}) *sql.Row {
 	return m.db.QueryRow(query, args...)
 }
 
+// ExecContext performs an execute returning sql.Result. This mirrors
+// SQLiteDB.ExecContext so both types satisfy a common driver interface.
+func (m *MySqlDB) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return m.db.ExecContext(ctx, query, args...)
+}
+
+// QueryContext performs a query with context.
+func (m *MySqlDB) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	return m.db.QueryContext(ctx, query, args...)
+}
+
+// QueryRowContext performs a single-row query with context.
+func (m *MySqlDB) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	return m.db.QueryRowContext(ctx, query, args...)
+}
+
 // BeginTransaction begin transaction
 func (m *MySqlDB) BeginTransaction() (*sql.Tx, error) {
 	// perform begin transaction

@@ -45,33 +45,43 @@ const (
 	SubTypeAKAClientError        SubType = 14
 )
 
-// AttrType is the EAP-AKA attribute type.
+// AttrType is the EAP-AKA/AKA' attribute type.
+// Values are defined in RFC 4187 §10.1 (EAP-AKA) and RFC 5448 §3 (EAP-AKA').
 type AttrType uint8
 
 const (
-	AttrRAND              AttrType = 1
-	AttrAUTN              AttrType = 2
-	AttrRES               AttrType = 3
-	AttrAUTS              AttrType = 4
-	AttrPermanentIDReq    AttrType = 10
-	AttrMAC               AttrType = 11
-	AttrNotification      AttrType = 12
-	AttrAnyIDReq          AttrType = 13
-	AttrIdentity          AttrType = 14
-	AttrClientErrorCode   AttrType = 22
-	AttrFullAuthIDReq     AttrType = 17
-	AttrCounter           AttrType = 19
-	AttrCounterTooSmall   AttrType = 20
-	AttrNonceMT           AttrType = 21
-	AttrNonceS            AttrType = 21
-	AttrKDF               AttrType = 24  // EAP-AKA' only
-	AttrKDFInput          AttrType = 23  // EAP-AKA' only
-	AttrBidding           AttrType = 136 // EAP-AKA' only
-	AttrIV                AttrType = 129
-	AttrEncData           AttrType = 130
-	AttrPaddingAttr       AttrType = 6
-	AttrResultInd         AttrType = 15
-	AttrCheckCode         AttrType = 134
+	// ---- Non-skippable attributes (1–127, RFC 4187 §10.1) ----
+
+	AttrRAND            AttrType = 1  // Random challenge (16 bytes)
+	AttrAUTN            AttrType = 2  // Authentication token (16 bytes)
+	AttrRES             AttrType = 3  // Response value
+	AttrAUTS            AttrType = 4  // Re-synchronisation token (14 bytes)
+	AttrPaddingAttr     AttrType = 6  // Padding (for encryption alignment)
+	AttrPermanentIDReq  AttrType = 10 // Request permanent identity
+	AttrMAC             AttrType = 11 // Message authentication code (16 bytes)
+	AttrNotification    AttrType = 12 // Notification code
+	AttrAnyIDReq        AttrType = 13 // Request any identity
+	AttrIdentity        AttrType = 14 // Identity value
+	AttrResultInd       AttrType = 15 // Result indication
+	AttrFullAuthIDReq   AttrType = 17 // Request full authentication identity
+	AttrCounter         AttrType = 19 // Re-authentication counter
+	AttrCounterTooSmall AttrType = 20 // Counter too small notification
+	AttrNonceMT         AttrType = 21 // Nonce from mobile terminal (EAP-AKA re-auth, RFC 4187 §10.1)
+	AttrClientErrorCode AttrType = 22 // Client error code
+
+	// ---- EAP-AKA' specific non-skippable attributes (RFC 5448 §3) ----
+	// AT_NONCE_S does not exist in EAP-AKA or EAP-AKA'; it belongs to EAP-SIM (RFC 4186).
+	// It is intentionally omitted here to avoid confusion with AttrNonceMT.
+
+	AttrKDFInput AttrType = 23 // Network name input to KDF (EAP-AKA' only, RFC 5448 §3.1)
+	AttrKDF      AttrType = 24 // Key Derivation Function identifier (EAP-AKA' only, RFC 5448 §3.2)
+
+	// ---- Skippable attributes (128–255, RFC 4187 §10.1) ----
+
+	AttrIV        AttrType = 129 // Initialisation vector for AT_ENCR_DATA
+	AttrEncData   AttrType = 130 // Encrypted data block
+	AttrCheckCode AttrType = 134 // Integrity check over plaintext EAP packet
+	AttrBidding   AttrType = 136 // Bidding-down prevention (EAP-AKA' only, RFC 5448 §4)
 )
 
 // Attribute is a single EAP-AKA TLV attribute.
@@ -98,15 +108,20 @@ func (m *Message) Encode() ([]byte, error) {
 			body = append(body, uint8(m.SubType))
 			body = append(body, 0, 0) // reserved
 			for _, attr := range m.Attributes {
-				// each attribute: type(1) + length(1, in 4-byte units) + value
-				padded := attr.Value
-				// pad to 4-byte boundary
-				if rem := len(padded) % 4; rem != 0 {
-					padded = append(padded, make([]byte, 4-rem)...)
-				}
-				attrLen := uint8((2 + len(padded)) / 4)
+				// EAP-AKA/AKA' attribute (RFC 4187 §8.1):
+				//   Type(1) | Length(1, in 4-byte units) | Value
+				// The whole attribute (2 + len(Value)) must be padded to a
+				// multiple of 4 bytes. We append attr.Value into body directly
+				// (never append into attr.Value, which would corrupt the
+				// caller's backing array) and add zero padding separately.
+				valLen := len(attr.Value)
+				padLen := (4 - (2+valLen)%4) % 4
+				attrLen := uint8((2 + valLen + padLen) / 4)
 				body = append(body, uint8(attr.Type), attrLen)
-				body = append(body, padded...)
+				body = append(body, attr.Value...)
+				if padLen > 0 {
+					body = append(body, make([]byte, padLen)...)
+				}
 			}
 		}
 	}
@@ -189,8 +204,12 @@ type AKAPrimeKeys struct {
 func DeriveAKAPrimeKeys(ckPrime, ikPrime []byte, identity string) (*AKAPrimeKeys, error) {
 	// PRF' = HMAC-SHA-256
 	// MK = PRF'(IK'|CK', "EAP-AKA'" | identity)
-	key := append(ikPrime, ckPrime...)
-	label := []byte("EAP-AKA'")
+	key := make([]byte, 0, len(ikPrime)+len(ckPrime))
+	key = append(key, ikPrime...)
+	key = append(key, ckPrime...)
+
+	label := make([]byte, 0, len("EAP-AKA'")+len(identity))
+	label = append(label, []byte("EAP-AKA'")...)
 	label = append(label, []byte(identity)...)
 
 	// Generate 208 bytes of keying material
@@ -212,7 +231,10 @@ func prfPrime(key, seed []byte, length int) []byte {
 	var prev []byte
 	counter := uint8(1)
 	for len(result) < length {
-		input := append(prev, seed...)
+		// Fresh backing array to avoid append() aliasing prev/seed storage.
+		input := make([]byte, 0, len(prev)+len(seed)+1)
+		input = append(input, prev...)
+		input = append(input, seed...)
 		input = append(input, counter)
 		mac := hmac.New(sha256.New, key)
 		mac.Write(input)
@@ -258,31 +280,45 @@ func GenerateRAND() ([]byte, error) {
 	return b, err
 }
 
-// CKPrimeIKPrime derives CK' and IK' from CK, IK, and the serving network name.
-// Based on 3GPP TS 33.402 Annex A.
-func CKPrimeIKPrime(ck, ik []byte, servingNetworkName string) (ckPrime, ikPrime []byte) {
-	// FC = 0x20, P0 = serving network name, L0 = len(serving network name)
-	// Key = CK || IK
-	// S = FC || P0 || L0 || P1 || L1
-	key := append(ck, ik...)
-	fc := []byte{0x20}
-	snName := []byte(servingNetworkName)
-	snLen := make([]byte, 2)
-	binary.BigEndian.PutUint16(snLen, uint16(len(snName)))
+// CKPrimeIKPrime derives CK' and IK' from CK, IK, the serving network name,
+// and SQN⊕AK, per 3GPP TS 33.402 Annex A (which uses the generic KDF defined
+// in TS 33.220 Annex B).
+//
+// The KDF is:
+//
+//	derived = HMAC-SHA-256(CK || IK, S)
+//	S       = FC || P0 || L0 || P1 || L1
+//	FC      = 0x20
+//	P0      = serving network name,  L0 = len(P0)   (2-byte big-endian)
+//	P1      = SQN XOR AK (6 bytes),  L1 = len(P1)=6 (2-byte big-endian)
+//
+// The 256-bit output is split directly: CK' = derived[0:16], IK' = derived[16:32].
+// There is NO XOR with the original CK/IK (that was a bug in the previous
+// implementation and would have produced wrong keys).
+func CKPrimeIKPrime(ck, ik []byte, servingNetworkName string, sqnXorAK []byte) (ckPrime, ikPrime []byte) {
+	key := make([]byte, 0, len(ck)+len(ik))
+	key = append(key, ck...)
+	key = append(key, ik...)
 
-	s := append(fc, snName...)
-	s = append(s, snLen...)
+	snName := []byte(servingNetworkName)
+	l0 := make([]byte, 2)
+	binary.BigEndian.PutUint16(l0, uint16(len(snName)))
+	l1 := make([]byte, 2)
+	binary.BigEndian.PutUint16(l1, uint16(len(sqnXorAK)))
+
+	// S = FC || P0 || L0 || P1 || L1
+	s := make([]byte, 0, 1+len(snName)+2+len(sqnXorAK)+2)
+	s = append(s, 0x20) // FC
+	s = append(s, snName...)
+	s = append(s, l0...)
+	s = append(s, sqnXorAK...)
+	s = append(s, l1...)
 
 	mac := hmac.New(sha256.New, key)
 	mac.Write(s)
-	derived := mac.Sum(nil)
+	derived := mac.Sum(nil) // 32 bytes
 
-	// CK' = first 16 bytes XOR with CK, IK' = next 16 bytes XOR with IK
-	ckPrime = make([]byte, 16)
-	ikPrime = make([]byte, 16)
-	for i := 0; i < 16; i++ {
-		ckPrime[i] = derived[i] ^ ck[i]
-		ikPrime[i] = derived[16+i] ^ ik[i]
-	}
+	ckPrime = append([]byte{}, derived[0:16]...)
+	ikPrime = append([]byte{}, derived[16:32]...)
 	return ckPrime, ikPrime
 }

@@ -74,6 +74,21 @@ func (h *GTPUHeader) Encode() []byte {
 	return b
 }
 
+// Marshal builds a complete GTP-U packet (header + payload) and sets the Length
+// field correctly. Per 3GPP TS 29.281 §5.1, Length is the number of octets
+// following the mandatory 8-byte header, i.e. it INCLUDES the 4-byte optional
+// header (Sequence Number / N-PDU Number / Next Extension Header Type) when any
+// of the E/S/PN flags is set, plus the payload length. Callers should use this
+// instead of setting Length manually.
+func (h *GTPUHeader) Marshal(payload []byte) []byte {
+	optionalLen := 0
+	if h.ExtensionHeader || h.SequenceNumber || h.NPDUNumber {
+		optionalLen = GTPUOptionalHeaderLen
+	}
+	h.Length = uint16(optionalLen + len(payload))
+	return append(h.Encode(), payload...)
+}
+
 // DecodeGTPUHeader parses a GTP-U header from a byte slice.
 func DecodeGTPUHeader(b []byte) (*GTPUHeader, int, error) {
 	if len(b) < GTPUMandatoryHeaderLen {
@@ -207,10 +222,9 @@ func (s *Server) SendGPDU(tunnel *Tunnel, payload []byte) error {
 	hdr := &GTPUHeader{
 		Version:     1,
 		MessageType: MsgTypeGPDU,
-		Length:      uint16(len(payload)),
 		TEID:        tunnel.RemoteTEID,
 	}
-	packet := append(hdr.Encode(), payload...)
+	packet := hdr.Marshal(payload)
 	_, err := s.conn.WriteToUDP(packet, tunnel.RemoteAddr)
 	if err != nil {
 		return fmt.Errorf("GTP-U send: %w", err)
@@ -268,13 +282,15 @@ func (s *Server) sendEchoResponse(dst *net.UDPAddr, seqNum uint16) {
 	hdr := &GTPUHeader{
 		Version:        1,
 		MessageType:    MsgTypeEchoResponse,
-		Length:         4,
 		TEID:           0,
 		SequenceNumber: true,
 		SeqNum:         seqNum,
 	}
-	// Recovery IE (type=14, value=0)
+	// Recovery IE (type=14, value=0). Marshal computes Length to include both
+	// the 4-byte optional header and this IE.
 	recovery := []byte{14, 0, 0, 1, 0}
-	packet := append(hdr.Encode(), recovery...)
-	s.conn.WriteToUDP(packet, dst)
+	packet := hdr.Marshal(recovery)
+	if _, err := s.conn.WriteToUDP(packet, dst); err != nil {
+		logger.Warnf("GTP-U: send echo response to %s: %v", dst, err)
+	}
 }

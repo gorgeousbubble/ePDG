@@ -18,12 +18,20 @@ const (
 	TransformTypeESN   TransformType = 5 // Extended Sequence Numbers
 )
 
-// Encryption algorithm IDs
+// Encryption algorithm transform IDs (RFC 7296 §3.3.2 / IANA IKEv2 registry).
+// AES key length (128/192/256) is NOT encoded in the transform ID; it is carried
+// in a separate KEY_LENGTH transform attribute (see KeyLengthAttribute), so a
+// single ID is shared by all AES-CBC / AES-GCM key sizes.
 const (
-	EncrAESCBC128 uint16 = 12
-	EncrAESCBC192 uint16 = 12
-	EncrAESCBC256 uint16 = 12
-	EncrAESGCM16  uint16 = 20
+	EncrDES     uint16 = 2  // ENCR_DES (56-bit, insecure, do not use)
+	Encr3DES    uint16 = 3  // ENCR_3DES
+	EncrNull    uint16 = 11 // ENCR_NULL (no encryption)
+	EncrAESCBC  uint16 = 12 // ENCR_AES_CBC   (key length via KEY_LENGTH attr)
+	EncrAESCTR  uint16 = 13 // ENCR_AES_CTR
+	EncrAESGCM8 uint16 = 18 // ENCR_AES_GCM with 8-octet ICV
+	EncrAESGCM12 uint16 = 19 // ENCR_AES_GCM with 12-octet ICV
+	EncrAESGCM16 uint16 = 20 // ENCR_AES_GCM with 16-octet ICV
+	EncrChaCha20Poly1305 uint16 = 28 // ENCR_CHACHA20_POLY1305
 )
 
 // Integrity algorithm IDs
@@ -259,6 +267,17 @@ type IDPayload struct {
 	payloadType PayloadType
 	IDType      IDType
 	IDData      []byte
+}
+
+// NewIDPayload constructs an ID payload with the correct payload type
+// (PayloadTypeIDi or PayloadTypeIDr). This is required because payloadType
+// is unexported and must be set for correct payload chaining during encode.
+func NewIDPayload(t PayloadType, idType IDType, data []byte) *IDPayload {
+	return &IDPayload{
+		payloadType: t,
+		IDType:      idType,
+		IDData:      data,
+	}
 }
 
 func (id *IDPayload) Type() PayloadType { return id.payloadType }

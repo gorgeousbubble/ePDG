@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/binary"
@@ -97,7 +98,11 @@ func PRFPlus(key, seed []byte, length int) []byte {
 	var prev []byte
 	counter := uint8(1)
 	for len(result) < length {
-		input := append(prev, seed...)
+		// Build input = prev | seed | counter with a fresh backing array to
+		// avoid append() aliasing prev's (or seed's) underlying storage.
+		input := make([]byte, 0, len(prev)+len(seed)+1)
+		input = append(input, prev...)
+		input = append(input, seed...)
 		input = append(input, counter)
 		t := PRF(key, input)
 		result = append(result, t...)
@@ -113,11 +118,15 @@ func PRFPlus(key, seed []byte, length int) []byte {
 // Returns SK_d, SK_ai, SK_ar, SK_ei, SK_er, SK_pi, SK_pr.
 func DeriveIKEKeys(dhShared, nI, nR []byte, spiI, spiR [8]byte) *IKEKeyMaterial {
 	// SKEYSEED = prf(Ni | Nr, g^ir)
-	nonce := append(nI, nR...)
+	nonce := make([]byte, 0, len(nI)+len(nR))
+	nonce = append(nonce, nI...)
+	nonce = append(nonce, nR...)
 	skeySeed := PRF(nonce, dhShared)
 
 	// S = Ni | Nr | SPIi | SPIr
-	s := append(nonce, spiI[:]...)
+	s := make([]byte, 0, len(nonce)+len(spiI)+len(spiR))
+	s = append(s, nonce...)
+	s = append(s, spiI[:]...)
 	s = append(s, spiR[:]...)
 
 	// Generate 7 keys: SK_d(32) + SK_ai(32) + SK_ar(32) + SK_ei(32) + SK_er(32) + SK_pi(32) + SK_pr(32) = 224 bytes
@@ -156,7 +165,9 @@ type IKEKeyMaterial struct {
 
 // DeriveChildKeys derives Child SA keys from SK_d.
 func DeriveChildKeys(skD, nI, nR []byte, encKeyLen, integKeyLen int) *ChildKeyMaterial {
-	seed := append(nI, nR...)
+	seed := make([]byte, 0, len(nI)+len(nR))
+	seed = append(seed, nI...)
+	seed = append(seed, nR...)
 	totalLen := 2*encKeyLen + 2*integKeyLen
 	keyMat := PRFPlus(skD, seed, totalLen)
 	offset := 0
@@ -259,7 +270,9 @@ func DecryptAESCBC(key, data []byte) ([]byte, error) {
 // signedOctets = message1 | nonce | prf(SK_px, IDx)
 func ComputeAuthPayload(skPx, message1, nonce, idPayloadBody []byte) []byte {
 	idHash := PRF(skPx, idPayloadBody)
-	signed := append(message1, nonce...)
+	signed := make([]byte, 0, len(message1)+len(nonce)+len(idHash))
+	signed = append(signed, message1...)
+	signed = append(signed, nonce...)
 	signed = append(signed, idHash...)
 	return PRF(skPx, signed)
 }
@@ -277,10 +290,16 @@ func GenerateNonce(length int) ([]byte, error) {
 
 // ---- NAT Detection (RFC 7296 §3.10.1) ----
 
-// NATDetectionHash computes the NAT detection hash:
-// SHA1(SPIi | SPIr | IP | Port)
+// NATDetectionHash computes the NAT detection hash used in the
+// NAT_DETECTION_SOURCE_IP / NAT_DETECTION_DESTINATION_IP notifications:
+//
+//	SHA1(SPIi | SPIr | IP | Port)
+//
+// RFC 7296 §2.23 / §3.10.1 mandates SHA-1 here for interoperability with
+// standard IKEv2 peers (strongSwan, iOS, Android). This is not a security-
+// sensitive hash; it is a fixed protocol construction, so SHA-1 is correct.
 func NATDetectionHash(spiI, spiR [8]byte, ip []byte, port uint16) []byte {
-	h := sha256.New()
+	h := sha1.New()
 	h.Write(spiI[:])
 	h.Write(spiR[:])
 	h.Write(ip)

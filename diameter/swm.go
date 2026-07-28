@@ -5,6 +5,7 @@ package diameter
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -21,16 +22,16 @@ const (
 	AppIDBase    uint32 = 0        // Diameter Base
 )
 
-// Command Codes (3GPP TS 29.273)
+// Command Codes (3GPP TS 29.273 / RFC 6733).
+// In Diameter a Request and its Answer share the same Command Code; they are
+// distinguished by the R (Request) bit in the header flags. Hence only one
+// constant per command is defined here (e.g. the DEA answer to a DER also uses
+// CmdDER = 268).
 const (
-	CmdDER uint32 = 268 // Diameter EAP Request
-	CmdDEA uint32 = 268 // Diameter EAP Answer
-	CmdAAR uint32 = 265 // AA-Request
-	CmdAAA uint32 = 265 // AA-Answer
-	CmdSTR uint32 = 275 // Session-Termination-Request
-	CmdSTA uint32 = 275 // Session-Termination-Answer
-	CmdASR uint32 = 274 // Abort-Session-Request
-	CmdASA uint32 = 274 // Abort-Session-Answer
+	CmdDER uint32 = 268 // Diameter-EAP-Request / Answer
+	CmdAA  uint32 = 265 // AA-Request / Answer
+	CmdSTR uint32 = 275 // Session-Termination-Request / Answer
+	CmdASR uint32 = 274 // Abort-Session-Request / Answer
 )
 
 // Result codes (RFC 6733 §7.1)
@@ -325,13 +326,16 @@ func NewClient(addr, originHost, originRealm, destRealm string, timeout time.Dur
 
 // Connect establishes a TCP connection to the AAA server.
 func (c *Client) Connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	conn, err := net.DialTimeout("tcp", c.addr, c.timeout)
 	if err != nil {
 		return fmt.Errorf("diameter: connect to %s: %w", c.addr, err)
 	}
+	// Publish the connection under the lock, then release it before starting
+	// readLoop so the goroutine does not contend with this method for c.mu.
+	c.mu.Lock()
 	c.conn = conn
+	c.mu.Unlock()
+
 	go c.readLoop()
 	logger.Infof("Diameter SWm connected to %s", c.addr)
 	return nil
@@ -357,7 +361,10 @@ func (c *Client) nextEndToEnd() uint32 {
 	return atomic.AddUint32(&c.endToEnd, 1)
 }
 
-// sendRequest sends a Diameter request and waits for the answer.
+// sendRequest sends a Diameter request and waits for the answer, retrying on
+// timeout up to retryCount times. The hop-by-hop ID is constant across retries
+// so the same pending channel matches the answer, and retransmissions carry the
+// T (potentially re-transmitted) flag per RFC 6733 §6.1.
 func (c *Client) sendRequest(msg []byte, hopByHop uint32) (*DiameterMessage, error) {
 	ch := make(chan *DiameterMessage, 1)
 	c.pendingMu.Lock()
@@ -369,41 +376,62 @@ func (c *Client) sendRequest(msg []byte, hopByHop uint32) (*DiameterMessage, err
 		c.pendingMu.Unlock()
 	}()
 
-	c.mu.Lock()
-	if c.conn == nil {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("diameter: not connected")
-	}
-	_, err := c.conn.Write(msg)
-	c.mu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("diameter: send: %w", err)
+	attempts := c.retryCount + 1
+	if attempts < 1 {
+		attempts = 1
 	}
 
-	select {
-	case resp := <-ch:
-		return resp, nil
-	case <-time.After(c.timeout):
-		return nil, fmt.Errorf("diameter: request timeout")
-	}
-}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		// On retransmissions set the T flag (bit 0x10 of the flags byte at
+		// header offset 4). Work on a copy to avoid mutating the caller's slice.
+		out := msg
+		if attempt > 0 {
+			out = append([]byte(nil), msg...)
+			out[4] |= FlagRetransmit
+		}
 
-// readLoop reads incoming Diameter messages and dispatches them.
-func (c *Client) readLoop() {
-	buf := make([]byte, 65536)
-	for {
 		c.mu.Lock()
 		conn := c.conn
 		c.mu.Unlock()
 		if conn == nil {
-			return
+			return nil, fmt.Errorf("diameter: not connected")
 		}
-		n, err := conn.Read(buf)
+		if _, err := conn.Write(out); err != nil {
+			// A write error means the connection is broken; retrying on the
+			// same connection will not help, so fail fast.
+			return nil, fmt.Errorf("diameter: send: %w", err)
+		}
+
+		select {
+		case resp := <-ch:
+			return resp, nil
+		case <-time.After(c.timeout):
+			lastErr = fmt.Errorf("diameter: request timeout (attempt %d/%d)", attempt+1, attempts)
+			logger.Warnf("Diameter: %v, hop-by-hop=%d", lastErr, hopByHop)
+		}
+	}
+	return nil, lastErr
+}
+
+// readLoop reads incoming Diameter messages and dispatches them.
+func (c *Client) readLoop() {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	for {
+		raw, err := readDiameterFrame(conn)
 		if err != nil {
-			logger.Errorf("Diameter read error: %v", err)
+			// Stop the loop on any read error (connection closed/reset).
+			if err != io.EOF {
+				logger.Errorf("Diameter read error: %v", err)
+			}
 			return
 		}
-		msg, err := DecodeDiameterMessage(buf[:n])
+		msg, err := DecodeDiameterMessage(raw)
 		if err != nil {
 			logger.Errorf("Diameter decode error: %v", err)
 			continue
@@ -416,6 +444,31 @@ func (c *Client) readLoop() {
 			ch <- msg
 		}
 	}
+}
+
+// readDiameterFrame reads exactly one complete Diameter message from the TCP
+// stream. Because TCP is a byte stream, a single Read may return partial data
+// or several coalesced messages, so we first read the fixed 20-byte header,
+// extract the 24-bit Message Length field, then read the remainder with
+// io.ReadFull.
+func readDiameterFrame(conn net.Conn) ([]byte, error) {
+	hdr := make([]byte, DiameterHeaderLen)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return nil, err
+	}
+	// Message Length is a 24-bit big-endian field at bytes 1..3.
+	msgLen := int(uint32(hdr[1])<<16 | uint32(hdr[2])<<8 | uint32(hdr[3]))
+	if msgLen < DiameterHeaderLen {
+		return nil, fmt.Errorf("diameter: invalid message length %d", msgLen)
+	}
+	full := make([]byte, msgLen)
+	copy(full, hdr)
+	if msgLen > DiameterHeaderLen {
+		if _, err := io.ReadFull(conn, full[DiameterHeaderLen:]); err != nil {
+			return nil, err
+		}
+	}
+	return full, nil
 }
 
 // ---- DER/DEA (Diameter EAP Request/Answer) ----
