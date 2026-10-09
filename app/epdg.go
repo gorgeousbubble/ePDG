@@ -22,13 +22,13 @@ import (
 
 // ePDG is the main application struct.
 type ePDG struct {
-	cfg      *config.Config
-	sessions *session.Manager
-	store    *store.Store
-	diameter *diameter.Client
+	cfg       *config.Config
+	sessions  *session.Manager
+	store     *store.Store
+	diameter  *diameter.Client
 	ikeServer *ikeserver.Server
 	gtpServer *gtp.Server
-	stopCh   chan struct{}
+	stopCh    chan struct{}
 }
 
 // New creates a new ePDG application instance.
@@ -155,10 +155,10 @@ func (e *ePDG) Stop() {
 // Status returns a summary of the ePDG status.
 func (e *ePDG) Status() map[string]interface{} {
 	return map[string]interface{}{
-		"fqdn":          e.cfg.GetePDG().FQDN,
-		"plmn":          e.cfg.GetePDG().PLMN,
+		"fqdn":            e.cfg.GetePDG().FQDN,
+		"plmn":            e.cfg.GetePDG().PLMN,
 		"active_sessions": e.sessions.Count(),
-		"uptime":        time.Now().String(),
+		"uptime":          time.Now().String(),
 	}
 }
 

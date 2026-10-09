@@ -2,9 +2,10 @@
 // Implements 3GPP TS 23.402, TS 24.302, TS 33.402
 //
 // Interfaces:
-//   SWu  - UE to ePDG (IKEv2/IPSec, UDP 500/4500)
-//   SWm  - ePDG to 3GPP AAA Server (Diameter, TCP 3868)
-//   S2b  - ePDG to P-GW (GTPv2-C/GTP-U, UDP 2123/2152)
+//
+//	SWu  - UE to ePDG (IKEv2/IPSec, UDP 500/4500)
+//	SWm  - ePDG to 3GPP AAA Server (Diameter, TCP 3868)
+//	S2b  - ePDG to P-GW (GTPv2-C/GTP-U, UDP 2123/2152)
 package main
 
 import (
